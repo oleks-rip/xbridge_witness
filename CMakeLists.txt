@@ -31,7 +31,19 @@ set(CMAKE_VERBOSE_MAKEFILE 1)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Builds/CMake")
 
 #include(deps/Boost)
-find_package(SOCI REQUIRED)
+find_package(Boost REQUIRED
+  COMPONENTS
+    chrono
+    container
+    context
+    coroutine
+    date_time
+    filesystem
+    program_options
+    regex
+    system
+    thread
+)
 find_package(fmt REQUIRED)
 find_package(date REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -177,8 +189,6 @@ set(HEADERS
   src/xbwd/client/WebsocketClient.h
   src/xbwd/client/ChainListener.h
   src/xbwd/client/RpcResultParse.h
-  src/xbwd/core/DatabaseCon.h
-  src/xbwd/core/SociDB.h
   src/xbwd/federator/Federator.h
   src/xbwd/federator/FederatorEvents.cpp
   src/xbwd/federator/TxnSupport.h
@@ -198,8 +208,6 @@ set(SOURCES
   src/xbwd/client/WebsocketClient.cpp
   src/xbwd/client/ChainListener.cpp
   src/xbwd/client/RpcResultParse.cpp
-  src/xbwd/core/DatabaseCon.cpp
-  src/xbwd/core/SociDB.cpp
   src/xbwd/federator/Federator.cpp
   src/xbwd/federator/FederatorEvents.cpp
   src/xbwd/rpc/RPCClient.cpp
@@ -212,7 +220,6 @@ option(tests "Enable unit tests" ON)
 if (tests)
   set(UNIT_TESTS
     src/test/Config_test.cpp
-    src/test/DB_test.cpp
     src/test/main_test.cpp
     src/test/RPCClient_test.cpp
     src/test/RPCParse_test.cpp
@@ -234,7 +241,8 @@ if (is_linux)
 endif()
 target_include_directories (${PROJECT_NAME} PRIVATE src ${date_INCLUDE_DIR})
 target_link_libraries (${PROJECT_NAME} PUBLIC Ripple::xrpl_core XBridgeWitness::opts
-  SOCI::soci_core_static SOCI::soci_sqlite3_static fmt::fmt OpenSSL::Crypto OpenSSL::SSL)
+  Boost::boost Boost::chrono Boost::container Boost::coroutine Boost::date_time Boost::filesystem Boost::program_options Boost::regex Boost::system Boost::thread
+  fmt::fmt OpenSSL::Crypto OpenSSL::SSL)
 
 if (san)
   target_compile_options (${PROJECT_NAME}

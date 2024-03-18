@@ -1,7 +1,6 @@
 #pragma once
 
 #include <xbwd/app/Config.h>
-#include <xbwd/core/DatabaseCon.h>
 #include <xbwd/rpc/ServerHandler.h>
 
 #include <ripple/beast/utility/Journal.h>
@@ -52,9 +51,6 @@ class App : public BasicApp
     beast::Journal j_;
     std::thread logRotation_;
 
-    // Database for cross chain transactions
-    DatabaseCon xChainTxnDB_;
-
     boost::asio::signal_set signals_;
 
     std::shared_ptr<Federator> federator_;
@@ -84,9 +80,6 @@ public:
 
     void
     signalStop();
-
-    DatabaseCon&
-    getXChainTxnDB();
 
     config::Config&
     config();

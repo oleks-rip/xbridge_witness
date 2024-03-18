@@ -16,7 +16,6 @@
 
 #include <fmt/core.h>
 #include <openssl/crypto.h>
-#include <soci/soci-backend.h>
 
 #include <functional>
 #include <unordered_map>
@@ -57,119 +56,8 @@ doSelectAll(
     ChainType const chain)
 
 {
-    // TODO: Remove me
-    //
-
     result[ripple::jss::request] = in;
-
-    auto const& tblName = db_init::xChainTableName(chain);
-
-    {
-        auto session = app.getXChainTxnDB().checkoutDb();
-        soci::blob amtBlob(*session);
-        soci::blob bridgeBlob(*session);
-        soci::blob sendingAccountBlob(*session);
-        soci::blob rewardAccountBlob(*session);
-        soci::blob otherChainDstBlob(*session);
-        soci::blob signingAccountBlob(*session);
-        soci::blob publicKeyBlob(*session);
-        soci::blob signatureBlob(*session);
-
-        std::string transID;
-        int ledgerSeq;
-        int claimID;
-        int success;
-
-        auto sql = fmt::format(
-            R"sql(SELECT TransID, LedgerSeq, ClaimID, Success, DeliveredAmt,
-                         Bridge, SendingAccount, RewardAccount, OtherChainDst,
-                         SigningAccount, PublicKey, Signature
-                  FROM {table_name};
-            )sql",
-            fmt::arg("table_name", tblName));
-
-        soci::indicator otherChainDstInd;
-        soci::statement st =
-            ((*session).prepare << sql,
-             soci::into(transID),
-             soci::into(ledgerSeq),
-             soci::into(claimID),
-             soci::into(success),
-             soci::into(amtBlob),
-             soci::into(bridgeBlob),
-             soci::into(sendingAccountBlob),
-             soci::into(rewardAccountBlob),
-             soci::into(otherChainDstBlob, otherChainDstInd),
-             soci::into(signingAccountBlob),
-             soci::into(publicKeyBlob),
-             soci::into(signatureBlob));
-        st.execute();
-
-        std::vector<ripple::Attestations::AttestationClaim> claims;
-        std::optional<ripple::STXChainBridge> firstBridge;
-        while (st.fetch())
-        {
-            auto signingAccount =
-                convert<ripple::AccountID>(signingAccountBlob);
-            auto signingPK = convert<ripple::PublicKey>(publicKeyBlob);
-            auto sigBuf = convert<ripple::Buffer>(signatureBlob);
-            auto sendingAmount = convert<ripple::STAmount>(amtBlob);
-            auto sendingAccount =
-                convert<ripple::AccountID>(sendingAccountBlob);
-            auto rewardAccount = convert<ripple::AccountID>(rewardAccountBlob);
-            std::optional<ripple::AccountID> optDst;
-            if (otherChainDstInd == soci::i_ok)
-            {
-                optDst.emplace();
-                *optDst = convert<ripple::AccountID>(otherChainDstBlob);
-            }
-
-            auto bridge = convert<ripple::STXChainBridge>(bridgeBlob);
-            if (!firstBridge)
-            {
-                firstBridge = bridge;
-            }
-            else
-            {
-                assert(bridge == *firstBridge);
-            }
-
-            claims.emplace_back(
-                signingAccount,
-                signingPK,
-                sigBuf,
-                sendingAccount,
-                sendingAmount,
-                rewardAccount,
-                chain == ChainType::locking,
-                claimID,
-                optDst);
-        }
-
-        auto const& config(app.config());
-        if (config.useBatch)
-        {
-#ifdef USE_BATCH_ATTESTATION
-            ripple::STXChainAttestationBatch batch{
-                *firstBridge, claims.begin(), claims.end()};
-            result[ripple::sfXChainAttestationBatch.getJsonName()] =
-                batch.getJson(ripple::JsonOptions::none);
-#else
-            throw std::runtime_error(
-                "Please compile with USE_BATCH_ATTESTATION to use Batch "
-                "Attestations");
-#endif
-        }
-        else
-        {
-            auto& jclaims = (result["claims"] = Json::arrayValue);
-            for (auto const& claim : claims)
-            {
-                SubmissionClaim sc(0, 0, 0, *firstBridge, claim);
-                jclaims.append(sc.getJson(ripple::JsonOptions::none));
-            }
-        }
-    }
+    result["claims"] = Json::arrayValue;
 }
 
 void
@@ -238,121 +126,23 @@ doWitness(App& app, Json::Value const& in, Json::Value& result)
         return;
     }
 
-    auto const& tblName = db_init::xChainTableName(ct);
-
-    {
-        auto session = app.getXChainTxnDB().checkoutDb();
-        soci::blob amtBlob = convert(sendingAmount, *session);
-        soci::blob bridgeBlob = convert(bridge, *session);
-        soci::blob sendingAccountBlob = convert(sendingAccount, *session);
-        soci::blob rewardAccountBlob(*session);
-        soci::blob otherChainDstBlob(*session);
-        soci::blob signingAccountBlob(*session);
-        soci::blob publicKeyBlob(*session);
-        soci::blob signatureBlob(*session);
-
-        soci::indicator sigInd;
-        if (optDst)
-        {
-            otherChainDstBlob = convert(*optDst, *session);
-
-            auto sql = fmt::format(
-                R"sql(SELECT SigningAccount, Signature, PublicKey, RewardAccount FROM {table_name}
-                  WHERE ClaimID = :claimID and
-                        Success = 1 and
-                        DeliveredAmt = :amt and
-                        Bridge = :bridge and
-                        SendingAccount = :sendingAccount and
-                        OtherChainDst = :otherChainDst;
-            )sql",
-                fmt::arg("table_name", tblName));
-
-            *session << sql, soci::into(signingAccountBlob),
-                soci::into(signatureBlob, sigInd), soci::into(publicKeyBlob),
-                soci::into(rewardAccountBlob), soci::use(*optClaimID),
-                soci::use(amtBlob), soci::use(bridgeBlob),
-                soci::use(sendingAccountBlob), soci::use(otherChainDstBlob);
-        }
-        else
-        {
-            auto sql = fmt::format(
-                R"sql(SELECT SigningAccount, Signature, PublicKey, RewardAccount, OtherChainDst FROM {table_name}
-                  WHERE ClaimID = :claimID and
-                        Success = 1 and
-                        DeliveredAmt = :amt and
-                        Bridge = :bridge and
-                        SendingAccount = :sendingAccount;
-            )sql",
-                fmt::arg("table_name", tblName));
-
-            soci::indicator otherChainDstInd;
-            *session << sql, soci::into(signingAccountBlob),
-                soci::into(signatureBlob, sigInd), soci::into(publicKeyBlob),
-                soci::into(rewardAccountBlob),
-                soci::into(otherChainDstBlob, otherChainDstInd),
-                soci::use(*optClaimID), soci::use(amtBlob),
-                soci::use(bridgeBlob), soci::use(sendingAccountBlob);
-
-            if (otherChainDstInd == soci::i_ok)
-            {
-                optDst.emplace();
-                *optDst = convert<ripple::AccountID>(otherChainDstBlob);
-            }
-        }
-
-        // TODO: Check for multiple values
-        if (sigInd == soci::i_ok && publicKeyBlob.get_len() > 0 &&
-            rewardAccountBlob.get_len() > 0)
-        {
-            auto rewardAccount = convert<ripple::AccountID>(rewardAccountBlob);
-            auto signingAccount =
-                convert<ripple::AccountID>(signingAccountBlob);
-            auto signingPK = convert<ripple::PublicKey>(publicKeyBlob);
-            auto sigBuf = convert<ripple::Buffer>(signatureBlob);
-
-            ripple::Attestations::AttestationClaim claim{
-                signingAccount,
-                signingPK,
-                sigBuf,
-                sendingAccount,
-                sendingAmount,
-                rewardAccount,
-                ct == ChainType::locking,
-                claimID,
-                optDst};
-
-            auto const& config(app.config());
-            if (config.useBatch)
-            {
-#ifdef USE_BATCH_ATTESTATION
-                ripple::STXChainAttestationBatch batch{
-                    bridge, &claim, &claim + 1};
-                result[ripple::sfXChainAttestationBatch.getJsonName()] =
-                    batch.getJson(ripple::JsonOptions::none);
-#else
-                throw std::runtime_error(
-                    "Please compile with USE_BATCH_ATTESTATION to use Batch "
-                    "Attestations");
-#endif
-            }
-            else
-            {
-                SubmissionClaim sc(0, 0, 0, bridge, claim);
-                result["claim"] = sc.getJson(ripple::JsonOptions::none);
-            }
-        }
-        else
-        {
-            result[ripple::jss::error] = "invalidRequest";
-            result[ripple::jss::error_message] = "No such transaction";
-        }
-    }
+    result[ripple::jss::error] = "invalidRequest";
+    result[ripple::jss::error_message] = "No such transaction";
 }
 
 void
 doWitnessAccountCreate(App& app, Json::Value const& in, Json::Value& result)
 {
     result[ripple::jss::request] = in;
+
+    auto const f = app.federator();
+    if (!f)
+    {
+        result[ripple::jss::error] = "internalError";
+        result[ripple::jss::error_message] = "internal federator error";
+        return;
+    }
+
     auto optBridge = optFromJson<ripple::STXChainBridge>(in, "bridge");
     auto optAmt = optFromJson<ripple::STAmount>(in, "sending_amount");
     auto optRewardAmt = optFromJson<ripple::STAmount>(in, "reward_amount");
@@ -413,109 +203,8 @@ doWitnessAccountCreate(App& app, Json::Value const& in, Json::Value& result)
         return;
     }
 
-    auto const& tblName = db_init::xChainCreateAccountTableName(ct);
-
-    std::vector<std::uint8_t> const encodedBridge = [&] {
-        ripple::Serializer s;
-        bridge.add(s);
-        return std::move(s.modData());
-    }();
-
-    auto const encodedAmt = [&]() -> std::vector<std::uint8_t> {
-        ripple::Serializer s;
-        sendingAmount.add(s);
-        return std::move(s.modData());
-    }();
-    auto const encodedRewardAmt = [&]() -> std::vector<std::uint8_t> {
-        ripple::Serializer s;
-        rewardAmount.add(s);
-        return std::move(s.modData());
-    }();
-    {
-        auto session = app.getXChainTxnDB().checkoutDb();
-
-        soci::blob amtBlob = convert(encodedAmt, *session);
-        soci::blob rewardAmtBlob = convert(encodedRewardAmt, *session);
-        soci::blob bridgeBlob = convert(encodedBridge, *session);
-        soci::blob sendingAccountBlob = convert(sendingAccount, *session);
-        soci::blob otherChainDstBlob = convert(dst, *session);
-
-        soci::blob rewardAccountBlob(*session);
-        soci::blob signingAccountBlob(*session);
-        soci::blob publicKeyBlob(*session);
-        soci::blob signatureBlob(*session);
-
-        auto sql = fmt::format(
-            R"sql(SELECT SigningAccount, Signature, PublicKey, RewardAccount FROM {table_name}
-                  WHERE CreateCount = :createCount and
-                        Success = 1 and
-                        DeliveredAmt = :amt and
-                        RewardAmt = :rewardAmt and
-                        Bridge = :bridge and
-                        SendingAccount = :sendingAccount and
-                        OtherChainDst = :otherChainDst;
-            )sql",
-            fmt::arg("table_name", tblName));
-
-        *session << sql, soci::into(signingAccountBlob),
-            soci::into(signatureBlob), soci::into(publicKeyBlob),
-            soci::into(rewardAccountBlob), soci::use(createCount),
-            soci::use(amtBlob), soci::use(rewardAmtBlob), soci::use(bridgeBlob),
-            soci::use(sendingAccountBlob), soci::use(otherChainDstBlob);
-
-        // TODO: Check for multiple values
-        if (signatureBlob.get_len() > 0 && publicKeyBlob.get_len() > 0 &&
-            rewardAccountBlob.get_len() > 0)
-        {
-            auto rewardAccount = convert<ripple::AccountID>(rewardAccountBlob);
-            auto signingAccount =
-                convert<ripple::AccountID>(signingAccountBlob);
-            auto signingPK = convert<ripple::PublicKey>(publicKeyBlob);
-            auto sigBuf = convert<ripple::Buffer>(signatureBlob);
-
-            ripple::Attestations::AttestationCreateAccount createAccount{
-                signingAccount,
-                signingPK,
-                sigBuf,
-                sendingAccount,
-                sendingAmount,
-                rewardAmount,
-                rewardAccount,
-                ct == ChainType::locking,
-                createCount,
-                dst};
-
-            auto const& config(app.config());
-            if (config.useBatch)
-            {
-#ifdef USE_BATCH_ATTESTATION
-                ripple::AttestationBatch::AttestationClaim* nullClaim = nullptr;
-                ripple::STXChainAttestationBatch batch{
-                    bridge,
-                    nullClaim,
-                    nullClaim,
-                    &createAccount,
-                    &createAccount + 1};
-                result[ripple::sfXChainAttestationBatch.getJsonName()] =
-                    batch.getJson(ripple::JsonOptions::none);
-#else
-                throw std::runtime_error(
-                    "Please compile with USE_BATCH_ATTESTATION to use Batch "
-                    "Attestations");
-#endif
-            }
-            else
-            {
-                SubmissionCreateAccount ca(0, 0, 0, bridge, createAccount);
-                result["createAccount"] = ca.getJson(ripple::JsonOptions::none);
-            }
-        }
-        else
-        {
-            result[ripple::jss::error] = "invalidRequest";
-            result[ripple::jss::error_message] = "No such transaction";
-        }
-    }
+    result[ripple::jss::error] = "invalidRequest";
+    result[ripple::jss::error_message] = "No such transaction";
 }
 
 void
@@ -707,3 +396,4 @@ doCommand(
 
 }  // namespace rpc
 }  // namespace xbwd
+

@@ -59,16 +59,13 @@ App::App(
         logs_.silent(config->logSilent);
         return logs_.journal("App");
     }())
-    , xChainTxnDB_(
-          config->dataDir,
-          db_init::xChainDBName(),
-          db_init::xChainDBPragma(),
-          db_init::xChainDBInit(),
-          j_)
     , signals_(io_service_)
     , config_(std::move(config))
 {
     // TODO initialize the public and secret keys
+
+    JLOG(j_.info()) << "Application starting. Version is "
+                    << build_info::getVersionString();
 
     config_->rpcEndpoint = xbwd::rpc_call::addrToEndpoint(
         get_io_service(), config_->addrRpcEndpoint);
@@ -144,8 +141,6 @@ App::setup()
 void
 App::start()
 {
-    JLOG(j_.info()) << "Application starting. Version is "
-                    << build_info::getVersionString();
     if (federator_)
         federator_->start();
     // TODO: unlockMainLoop should go away
@@ -174,12 +169,6 @@ App::run()
     }
     JLOG(j_.debug()) << "Application stopping";
     stop();
-}
-
-DatabaseCon&
-App::getXChainTxnDB()
-{
-    return xChainTxnDB_;
 }
 
 void

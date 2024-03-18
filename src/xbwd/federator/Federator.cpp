@@ -44,6 +44,8 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <sstream>
 #include <stdexcept>
@@ -78,6 +80,7 @@ Federator::Federator(
     beast::Journal j)
     : app_{app}
     , bridge_{config.bridge}
+    , dataDir(config.dataDir.string())
     , chains_{Chain{config.lockingChainConfig}, Chain{config.issuingChainConfig}}
     , autoSubmit_{chains_[ChainType::locking].txnSubmit_ &&
                   chains_[ChainType::locking].txnSubmit_->shouldSubmit,
@@ -107,111 +110,30 @@ Federator::init(
     config::Config const& config,
     ripple::Logs& l)
 {
-    auto fillLastTxHash = [&]() -> bool {
-        try
+    std::filesystem::path fp(dataDir);
+    fp /= "settings.json";
+    std::fstream df(fp);
+
+    if (df)
+    {
+        std::stringstream ss;
+        ss << df.rdbuf();
+        std::string const s = ss.str();
+        if (!s.empty())
         {
-            auto session = app_.getXChainTxnDB().checkoutDb();
-            auto const sql = fmt::format(
-                R"sql(SELECT ChainType, TransID, LedgerSeq FROM {table_name};
-            )sql",
-                fmt::arg("table_name", db_init::xChainSyncTable));
-
-            std::uint32_t chainType = 0;
-            std::string transID;
-            std::uint32_t ledgerSeq = 0;
-            int rows = 0;
-            soci::statement st =
-                ((*session).prepare << sql,
-                 soci::into(chainType),
-                 soci::into(transID),
-                 soci::into(ledgerSeq));
-            st.execute();
-            while (st.fetch())
-            {
-                if (chainType !=
-                        static_cast<std::uint32_t>(ChainType::issuing) &&
-                    chainType != static_cast<std::uint32_t>(ChainType::locking))
-                {
-                    JLOG(j_.error())
-                        << "error reading database: unknown chain type "
-                        << chainType << ". Recreating init sync table.";
-                    return false;
-                }
-                auto const ct = static_cast<ChainType>(chainType);
-
-                if (!initSync_[ct].dbTxnHash_.parseHex(transID))
-                {
-                    JLOG(j_.error())
-                        << "error reading database: cannot parse transation "
-                           "hash "
-                        << transID << ". Recreating init sync table.";
-                    return false;
-                }
-
-                initSync_[ct].dbLedgerSqn_ = ledgerSeq;
-                ++rows;
-            }
-            return rows == 2;  // both chainTypes
+            Json::Value jv;
+            Json::Reader().parse(s, jv);
+            std::uint32_t const lastLockingLedger =
+                jv["LockingChain"]["processedLedger"].asUInt();
+            initSync_[ChainType::locking].dbLedgerSqn_ = lastLockingLedger;
+            std::uint32_t const lastIssuingLedger =
+                jv["IssuingChain"]["processedLedger"].asUInt();
+            initSync_[ChainType::issuing].dbLedgerSqn_ = lastIssuingLedger;
         }
-        catch (std::exception& e)
-        {
-            JLOGV(
-                j_.error(),
-                "error reading init sync table.",
-                jv("what", e.what()));
-            return false;
-        }
-    };
-
-    auto initializeInitSyncTable = [&]() {
-        try
-        {
-            {
-                auto session = app_.getXChainTxnDB().checkoutDb();
-                auto const sql = fmt::format(
-                    R"sql(DELETE FROM {table_name};
-            )sql",
-                    fmt::arg("table_name", db_init::xChainSyncTable));
-                *session << sql;
-            }
-            for (auto const ct : {ChainType::locking, ChainType::issuing})
-            {
-                initSync_[ct].dbLedgerSqn_ = 0u;
-                initSync_[ct].dbTxnHash_ = {};
-                auto const txnIdHex = ripple::strHex(
-                    initSync_[ct].dbTxnHash_.begin(),
-                    initSync_[ct].dbTxnHash_.end());
-                auto session = app_.getXChainTxnDB().checkoutDb();
-                auto const sql = fmt::format(
-                    R"sql(INSERT INTO {table_name}
-                      (ChainType, TransID, LedgerSeq)
-                      VALUES
-                      (:ct, :txnId, :lgrSeq);
-                )sql",
-                    fmt::arg("table_name", db_init::xChainSyncTable));
-                *session << sql, soci::use(static_cast<std::uint32_t>(ct)),
-                    soci::use(txnIdHex), soci::use(initSync_[ct].dbLedgerSqn_);
-            }
-            JLOG(j_.info()) << "created DB table for initial sync, "
-                            << db_init::xChainSyncTable;
-        }
-        catch (std::exception& e)
-        {
-            JLOGV(
-                j_.fatal(),
-                "error creating init sync table.",
-                jv("what", e.what()));
-            throw;
-        }
-    };
-
-    if (!fillLastTxHash())
-        initializeInitSyncTable();
+    }
 
     for (auto const ct : {ChainType::locking, ChainType::issuing})
     {
-        if (autoSubmit_[ct])
-            readDBAttests(ct);
         JLOGV(
             j_.info(),
             "Prepare init sync",
@@ -264,228 +186,6 @@ Federator::init(
     chains_[ChainType::issuing].listener_ = std::move(sidechainListener);
     chains_[ChainType::issuing].listener_->init(
         ios, config.issuingChainConfig.chainIp);
-}
-
-void
-Federator::readDBAttests(ChainType ct)
-{
-    auto const oct = otherChain(ct);
-    int commits = 0;
-    int creates = 0;
-
-    try
-    {
-        auto const& tblName = db_init::xChainCreateAccountTableName(ct);
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        soci::blob amtBlob(*session);
-        soci::blob rewardAmtBlob(*session);
-        soci::blob bridgeBlob(*session);
-        soci::blob sendingAccountBlob(*session);
-        soci::blob rewardAccountBlob(*session);
-        soci::blob otherChainDstBlob(*session);
-        soci::blob signingAccountBlob(*session);
-        soci::blob publicKeyBlob(*session);
-        soci::blob signatureBlob(*session);
-
-        std::string transID;
-        int ledgerSeq;
-        int createCount;
-        int success;
-
-        auto const sql = fmt::format(
-            R"sql(SELECT TransID, LedgerSeq, CreateCount, Success, DeliveredAmt, RewardAmt,
-                     Bridge, SendingAccount, RewardAccount, OtherChainDst,
-                     SigningAccount, PublicKey, Signature
-                  FROM {table_name} ORDER BY CreateCount;
-        )sql",
-            fmt::arg("table_name", tblName));
-
-        soci::indicator otherChainDstInd;
-        soci::statement st =
-            ((*session).prepare << sql,
-             soci::into(transID),
-             soci::into(ledgerSeq),
-             soci::into(createCount),
-             soci::into(success),
-             soci::into(amtBlob),
-             soci::into(rewardAmtBlob),
-             soci::into(bridgeBlob),
-             soci::into(sendingAccountBlob),
-             soci::into(rewardAccountBlob),
-             soci::into(otherChainDstBlob, otherChainDstInd),
-             soci::into(signingAccountBlob),
-             soci::into(publicKeyBlob),
-             soci::into(signatureBlob));
-        st.execute();
-
-        ripple::STXChainBridge bridge;
-
-        while (st.fetch())
-        {
-            auto signingAccount =
-                convert<ripple::AccountID>(signingAccountBlob);
-            auto signingPK = convert<ripple::PublicKey>(publicKeyBlob);
-            auto sigBuf = convert<ripple::Buffer>(signatureBlob);
-            auto sendingAmount = convert<ripple::STAmount>(amtBlob);
-            auto rewardAmount = convert<ripple::STAmount>(rewardAmtBlob);
-            auto sendingAccount =
-                convert<ripple::AccountID>(sendingAccountBlob);
-            auto rewardAccount = convert<ripple::AccountID>(rewardAccountBlob);
-            auto dstAccount = convert<ripple::AccountID>(otherChainDstBlob);
-            auto bridge = convert<ripple::STXChainBridge>(bridgeBlob);
-            if (bridge != bridge_)
-            {
-                JLOGV(
-                    j_.warn(),
-                    "readDBAttests bridge mismatch, skipping attestation",
-                    jv("db bridge", bridge.getJson(ripple::JsonOptions::none)),
-                    jv("current bridge",
-                       bridge_.getJson(ripple::JsonOptions::none)));
-                continue;
-            }
-
-            // The attestation will be created by the other chain
-            auto p = SubmissionPtr(new SubmissionCreateAccount(
-                0,  // will be updated when new ledger arrive
-                0,  // will be updated if resubmitted
-                0,  // will be updated when NetworkID arrive
-                bridge,
-                ripple::Attestations::AttestationCreateAccount{
-                    signingAccount,
-                    signingPK,
-                    sigBuf,
-                    sendingAccount,
-                    sendingAmount,
-                    rewardAmount,
-                    rewardAccount,
-                    ct == ChainType::locking,
-                    static_cast<std::uint64_t>(createCount),
-                    dstAccount}));
-            {
-                std::lock_guard tl{txnsMutex_};
-                submitted_[oct].emplace_back(std::move(p));
-            }
-
-            ++creates;
-        }
-    }
-    catch (std::exception& e)
-    {
-        JLOGV(
-            j_.fatal(),
-            "readDBAttests error reading createAccount table.",
-            jv("what", e.what()));
-        throw;
-    }
-
-    try
-    {
-        auto const& tblName = db_init::xChainTableName(ct);
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        soci::blob amtBlob(*session);
-        soci::blob bridgeBlob(*session);
-        soci::blob sendingAccountBlob(*session);
-        soci::blob rewardAccountBlob(*session);
-        soci::blob otherChainDstBlob(*session);
-        soci::blob signingAccountBlob(*session);
-        soci::blob publicKeyBlob(*session);
-        soci::blob signatureBlob(*session);
-
-        std::string transID;
-        int ledgerSeq;
-        int claimID;
-        int success;
-
-        auto const sql = fmt::format(
-            R"sql(SELECT TransID, LedgerSeq, ClaimID, Success, DeliveredAmt,
-                     Bridge, SendingAccount, RewardAccount, OtherChainDst,
-                     SigningAccount, PublicKey, Signature
-                  FROM {table_name} ORDER BY ClaimID;
-        )sql",
-            fmt::arg("table_name", tblName));
-
-        soci::indicator otherChainDstInd;
-        soci::statement st =
-            ((*session).prepare << sql,
-             soci::into(transID),
-             soci::into(ledgerSeq),
-             soci::into(claimID),
-             soci::into(success),
-             soci::into(amtBlob),
-             soci::into(bridgeBlob),
-             soci::into(sendingAccountBlob),
-             soci::into(rewardAccountBlob),
-             soci::into(otherChainDstBlob, otherChainDstInd),
-             soci::into(signingAccountBlob),
-             soci::into(publicKeyBlob),
-             soci::into(signatureBlob));
-        st.execute();
-
-        while (st.fetch())
-        {
-            auto signingAccount =
-                convert<ripple::AccountID>(signingAccountBlob);
-            auto signingPK = convert<ripple::PublicKey>(publicKeyBlob);
-            auto sigBuf = convert<ripple::Buffer>(signatureBlob);
-            auto sendingAmount = convert<ripple::STAmount>(amtBlob);
-            auto sendingAccount =
-                convert<ripple::AccountID>(sendingAccountBlob);
-            auto rewardAccount = convert<ripple::AccountID>(rewardAccountBlob);
-
-            std::optional<ripple::AccountID> optDst;
-            if (otherChainDstInd == soci::i_ok)
-            {
-                optDst.emplace();
-                *optDst = convert<ripple::AccountID>(otherChainDstBlob);
-            }
-
-            auto bridge = convert<ripple::STXChainBridge>(bridgeBlob);
-            if (bridge != bridge_)
-            {
-                JLOGV(
-                    j_.warn(),
-                    "readDBAttests bridge mismatch, skipping attestation",
-                    jv("db bridge", bridge.getJson(ripple::JsonOptions::none)),
-                    jv("current bridge",
-                       bridge_.getJson(ripple::JsonOptions::none)));
-                continue;
-            }
-
-            // The attestation will be created by the other chain
-            auto p = SubmissionPtr(new SubmissionClaim(
-                0,  // will be updated when new ledger arrive
-                0,  // will be updated if resubmitted
-                0,  // will be updated when NetworkID arrive
-                bridge,
-                ripple::Attestations::AttestationClaim{
-                    signingAccount,
-                    signingPK,
-                    sigBuf,
-                    sendingAccount,
-                    sendingAmount,
-                    rewardAccount,
-                    ct == ChainType::locking,
-                    static_cast<std::uint64_t>(claimID),
-                    optDst}));
-            {
-                std::lock_guard tl{txnsMutex_};
-                submitted_[oct].emplace_back(std::move(p));
-            }
-
-            ++commits;
-        }
-    }
-    catch (std::exception& e)
-    {
-        JLOGV(
-            j_.fatal(),
-            "readDBAttests error reading commit table.",
-            jv("what", e.what()));
-        throw;
-    }
-
-    JLOG(j_.info()) << "readDBAttests " << to_string(ct) << " commit "
-                    << commits << " create account " << creates;
 }
 
 Federator::~Federator()
@@ -746,29 +446,7 @@ Federator::onEvent(event::XChainCommitDetected const& e)
         return;
     }
 
-    auto const& tblName = db_init::xChainTableName(ct);
     auto const txnIdHex = ripple::strHex(e.txnHash_.begin(), e.txnHash_.end());
-    {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        auto const sql = fmt::format(
-            R"sql(SELECT count(*) FROM {table_name} WHERE TransID = "{tx_hex}";)sql",
-            fmt::arg("table_name", tblName),
-            fmt::arg("tx_hex", txnIdHex));
-
-        int count = 0;
-        *session << sql, soci::into(count);
-        if (session->got_data() && count > 0)
-        {
-            // Already have this transaction
-            // TODO: Sanity check the claim id and deliveredAmt match
-            // TODO: Stop historical transaction collection
-            JLOGV(
-                j_.fatal(),
-                "XChainCommitDetected already present",
-                jv("event", e.toJson()));
-            return;  // Don't store it again
-        }
-    }
 
     // soci complains about a bool
     int const success = ripple::isTesSuccess(e.status_) ? 1 : 0;
@@ -806,75 +484,6 @@ Federator::onEvent(event::XChainCommitDetected const& e)
     }();
 
     assert(!claimOpt || claimOpt->verify(e.bridge_));
-
-    {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-
-        // Soci blob does not play well with optional. Store an empty blob
-        // when missing delivered amount
-        soci::blob amtBlob = e.deliveredAmt_
-            ? convert(*e.deliveredAmt_, *session)
-            : soci::blob(*session);
-        soci::blob bridgeBlob = convert(bridge_, *session);
-        soci::blob sendingAccountBlob =
-            convert(ripple::AccountID(e.src_), *session);
-        soci::blob rewardAccountBlob = convert(rewardAccount, *session);
-        soci::blob signingAccountBlob = claimOpt
-            ? convert(claimOpt->attestationSignerAccount, *session)
-            : soci::blob(*session);
-        soci::blob publicKeyBlob = convert(signingPK_, *session);
-        soci::blob signatureBlob = claimOpt
-            ? convert(claimOpt->signature, *session)
-            : soci::blob(*session);
-        soci::blob otherChainDstBlob =
-            optDst ? convert(*optDst, *session) : soci::blob(*session);
-
-        JLOGV(
-            j_.trace(),
-            "Insert into claim table",
-            jv("chainType", to_string(ct)),
-            jv("tableName", tblName),
-            jv("success", success),
-            jv("ledgerSeq", e.ledgerSeq_),
-            jv("claimID", fmt::format("{:x}", e.claimID_)),
-            jv("amt",
-               e.deliveredAmt_ ? e.deliveredAmt_->getFullText()
-                               : std::string("no delivered amt")),
-            jv("sendingAccount", e.src_),
-            jv("rewardAccount", rewardAccount),
-            jv("otherChainDst",
-               !optDst || !*optDst ? std::string() : ripple::toBase58(*optDst)),
-            jv("signingAccount",
-               !claimOpt
-                   ? std::string()
-                   : ripple::toBase58(claimOpt->attestationSignerAccount)));
-
-        auto const sql = fmt::format(
-            R"sql(INSERT INTO {table_name}
-                  (TransID, LedgerSeq, ClaimID, Success, DeliveredAmt, Bridge,
-                   SendingAccount, RewardAccount, OtherChainDst, SigningAccount, PublicKey, Signature)
-                  VALUES
-                  (:txnId, :lgrSeq, :claimID, :success, :amt, :bridge,
-                   :sendingAccount, :rewardAccount, :otherChainDst, :signingAccount, :pk, :sig);
-            )sql",
-            fmt::arg("table_name", tblName));
-
-        *session << sql, soci::use(txnIdHex), soci::use(e.ledgerSeq_),
-            soci::use(e.claimID_), soci::use(success), soci::use(amtBlob),
-            soci::use(bridgeBlob), soci::use(sendingAccountBlob),
-            soci::use(rewardAccountBlob), soci::use(otherChainDstBlob),
-            soci::use(signingAccountBlob), soci::use(publicKeyBlob),
-            soci::use(signatureBlob);
-    }
-    {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        auto const sql = fmt::format(
-            R"sql(UPDATE {table_name} SET TransID = :tx_hash WHERE ChainType = :chain_type;
-            )sql",
-            fmt::arg("table_name", db_init::xChainSyncTable));
-        auto const chainType = static_cast<std::uint32_t>(ct);
-        *session << sql, soci::use(txnIdHex), soci::use(chainType);
-    }
 
     // The attestation will be created by the other chain
     if (autoSubmit_[oct] && claimOpt)
@@ -915,25 +524,7 @@ Federator::onEvent(event::XChainAccountCreateCommitDetected const& e)
         return;
     }
 
-    auto const& tblName = db_init::xChainCreateAccountTableName(ct);
     auto const txnIdHex = ripple::strHex(e.txnHash_.begin(), e.txnHash_.end());
-    {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        auto const sql = fmt::format(
-            R"sql(SELECT count(*) FROM {table_name} WHERE TransID = "{tx_hex}";)sql",
-            fmt::arg("table_name", tblName),
-            fmt::arg("tx_hex", txnIdHex));
-
-        int count = 0;
-        *session << sql, soci::into(count);
-        if (session->got_data() && count > 0)
-        {
-            // Already have this transaction
-            // TODO: Sanity check the claim id and deliveredAmt match
-            // TODO: Stop historical transaction collection
-            return;  // Don't store it again
-        }
-    }
 
     // soci complains about a bool
     int const success = ripple::isTesSuccess(e.status_) ? 1 : 0;
@@ -972,77 +563,6 @@ Federator::onEvent(event::XChainAccountCreateCommitDetected const& e)
     }();
 
     assert(!createOpt || createOpt->verify(e.bridge_));
-
-    {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-
-        // Soci blob does not play well with optional. Store an empty blob when
-        // missing delivered amount
-        soci::blob amtBlob = e.deliveredAmt_
-            ? convert(*e.deliveredAmt_, *session)
-            : soci::blob(*session);
-        soci::blob rewardAmtBlob = convert(*e.deliveredAmt_, *session);
-        soci::blob bridgeBlob = convert(bridge_, *session);
-        // Convert to an AccountID first, because if the type changes we want to
-        // catch it.
-        ripple::AccountID const& sendingAccount{e.src_};
-        soci::blob sendingAccountBlob = convert(sendingAccount, *session);
-        soci::blob rewardAccountBlob = convert(rewardAccount, *session);
-        soci::blob signingAccountBlob = createOpt
-            ? convert(createOpt->attestationSignerAccount, *session)
-            : soci::blob(*session);
-        soci::blob publicKeyBlob = convert(signingPK_, *session);
-        soci::blob signatureBlob = createOpt
-            ? convert(createOpt->signature, *session)
-            : soci::blob(*session);
-        soci::blob otherChainDstBlob = convert(dst, *session);
-
-        JLOGV(
-            j_.trace(),
-            "Insert into create table",
-            jv("chainType", to_string(ct)),
-            jv("tableName", tblName),
-            jv("success", success),
-            jv("ledgerSeq", e.ledgerSeq_),
-            jv("createCount", fmt::format("{:x}", e.createCount_)),
-            jv("amt",
-               e.deliveredAmt_ ? e.deliveredAmt_->getFullText()
-                               : std::string("no delivered amt")),
-            jv("rewardAmt", e.rewardAmt_),
-            jv("sendingAccount", sendingAccount),
-            jv("rewardAccount", rewardAccount),
-            jv("otherChainDst", dst),
-            jv("signingAccount",
-               !createOpt
-                   ? std::string()
-                   : ripple::toBase58(createOpt->attestationSignerAccount)));
-
-        auto const sql = fmt::format(
-            R"sql(INSERT INTO {table_name}
-                  (TransID, LedgerSeq, CreateCount, Success, DeliveredAmt, RewardAmt, Bridge,
-                   SendingAccount, RewardAccount, otherChainDst, SigningAccount, PublicKey, Signature)
-                  VALUES
-                  (:txnId, :lgrSeq, :createCount, :success, :amt, :rewardAmt, :bridge,
-                   :sendingAccount, :rewardAccount, :otherChainDst, :signingAccount, :pk, :sig);
-            )sql",
-            fmt::arg("table_name", tblName));
-
-        *session << sql, soci::use(txnIdHex), soci::use(e.ledgerSeq_),
-            soci::use(e.createCount_), soci::use(success), soci::use(amtBlob),
-            soci::use(rewardAmtBlob), soci::use(bridgeBlob),
-            soci::use(sendingAccountBlob), soci::use(rewardAccountBlob),
-            soci::use(otherChainDstBlob), soci::use(signingAccountBlob),
-            soci::use(publicKeyBlob), soci::use(signatureBlob);
-    }
-    {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        auto const sql = fmt::format(
-            R"sql(UPDATE {table_name} SET TransID = :tx_hash WHERE ChainType = :chain_type;
-            )sql",
-            fmt::arg("table_name", db_init::xChainSyncTable));
-        auto const chainType = static_cast<std::uint32_t>(ct);
-        *session << sql, soci::use(txnIdHex), soci::use(chainType);
-    }
 
     // The attestation will be created by the other chain
     if (autoSubmit_[oct] && createOpt)
@@ -1205,8 +725,7 @@ Federator::onEvent(event::XChainAttestsResult const& e)
     {
         // Deleting events from the opposite side of the attestations
         auto const attestedIDs = sub->forAttestIDs(
-            [&](std::uint64_t id) { deleteFromDB(oct, id, false); },
-            [&](std::uint64_t id) { deleteFromDB(oct, id, true); });
+            [&](std::uint64_t id) {}, [&](std::uint64_t id) {});
         JLOGV(
             j_.trace(),
             "XChainAttestsResult processed",
@@ -1392,21 +911,34 @@ Federator::saveProcessedLedger(ChainType ct, std::uint32_t ledger)
 {
     if (ledger > initSync_[ct].dbLedgerSqn_)
     {
-        auto session = app_.getXChainTxnDB().checkoutDb();
-        auto const sql = fmt::format(
-            "UPDATE {} SET LedgerSeq = :ledger_sqn WHERE ChainType = "
-            ":chain_type;",
-            db_init::xChainSyncTable);
-        *session << sql, soci::use(ledger),
-            soci::use(static_cast<std::uint32_t>(ct));
-
         initSync_[ct].dbLedgerSqn_ = ledger;
 
-        JLOGV(
-            j_.trace(),
-            "syncDB update processed ledger",
-            jv("chainType", to_string(ct)),
-            jv("ledger", ledger));
+        std::filesystem::path fp(dataDir);
+        fp /= "settings.json";
+        std::fstream df(fp, std::ios_base::out | std::ios::trunc);
+
+        if (df)
+        {
+            Json::Value j;
+            j["LockingChain"] = Json::objectValue;
+            j["IssuingChain"] = Json::objectValue;
+            j["LockingChain"]["processedLedger"] =
+                initSync_[ChainType::locking].dbLedgerSqn_;
+            j["IssuingChain"]["processedLedger"] =
+                initSync_[ChainType::issuing].dbLedgerSqn_;
+            std::string const s = j.toStyledString();
+            df << s << std::endl;
+
+            JLOGV(
+                j_.trace(),
+                "syncDB update processed ledger",
+                jv("chainType", to_string(ct)),
+                jv("ledger", ledger));
+        }
+        else
+        {
+            throw std::runtime_error(fmt::format("Can't open {}", fp.string()));
+        }
     }
 }
 
@@ -2065,32 +1597,6 @@ Federator::getInfo() const
 }
 
 void
-Federator::deleteFromDB(ChainType ct, std::uint64_t id, bool isCreateAccount)
-{
-    auto session = app_.getXChainTxnDB().checkoutDb();
-    auto const& tblName = [&]() {
-        if (isCreateAccount)
-            return db_init::xChainCreateAccountTableName(ct);
-        else
-            return db_init::xChainTableName(ct);
-    }();
-
-    auto const sql = [&]() {
-        if (isCreateAccount)
-            return fmt::format(
-                R"sql(DELETE FROM {table_name} WHERE CreateCount = :cid;
-                )sql",
-                fmt::arg("table_name", tblName));
-        else
-            return fmt::format(
-                R"sql(DELETE FROM {table_name} WHERE ClaimID = :cid;
-                )sql",
-                fmt::arg("table_name", tblName));
-    }();
-    *session << sql, soci::use(id);
-};
-
-void
 Federator::pullAndAttestTx(
     ripple::STXChainBridge const& bridge,
     ChainType ct,
@@ -2189,6 +1695,25 @@ Federator::setNetworkID(std::uint32_t networkID, ChainType ct)
         for (auto& s : subs)
             s->networkID_ = networkID;
     }
+}
+
+ripple::AccountID
+Federator::getSigningAccount() const
+{
+    return signingAccount_ ? *signingAccount_
+                           : ripple::calcAccountID(signingPK_);
+}
+
+ripple::PublicKey
+Federator::getSigningPK() const
+{
+    return signingPK_;
+}
+
+ripple::SecretKey
+Federator::getSigningSK() const
+{
+    return signingSK_;
 }
 
 bool

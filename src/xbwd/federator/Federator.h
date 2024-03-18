@@ -314,6 +314,8 @@ class Federator : public std::enable_shared_from_this<Federator>
         explicit Chain(config::ChainConfig const& config);
     };
 
+    std::string const dataDir;
+
     ChainArray<Chain> chains_;
     ChainArray<bool const> const autoSubmit_;  // event thread only
 
@@ -453,6 +455,10 @@ public:
     void
     setNetworkID(std::uint32_t networkID, ChainType ct);
 
+    ripple::AccountID getSigningAccount() const;
+    ripple::PublicKey getSigningPK() const;
+    ripple::SecretKey getSigningSK() const;
+
 private:
     // Two phase init needed for shared_from this.
     // Only called from `make_Federator`
@@ -537,16 +543,6 @@ private:
 
     void
     submitTxn(SubmissionPtr&& submission, ChainType dstChain);
-
-    void
-    deleteFromDB(
-        ChainType ct,
-        std::uint64_t claimID,
-        bool isCreateAccount);  // TODO add bridge
-
-    // send the attestations for the events from this chain
-    void
-    readDBAttests(ChainType ct);
 
     friend std::shared_ptr<Federator>
     make_Federator(
