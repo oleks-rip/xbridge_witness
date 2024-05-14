@@ -12,6 +12,7 @@
 #include <ripple/beast/utility/Journal.h>
 #include <ripple/json/json_reader.h>
 #include <ripple/json/json_value.h>
+#include <ripple/json/json_writer.h>
 #include <ripple/protocol/jss.h>
 
 #include <boost/filesystem.hpp>
@@ -128,14 +129,20 @@ main(int argc, char** argv)
     try
     {
         std::unique_ptr<xbwd::config::Config> config = [&]() -> auto {
-            auto const configFile = [&]() -> std::string {
-                if (vm.count("conf"))
-                    return vm["conf"].as<std::string>();
+            if (!vm.count("conf"))
                 throw std::runtime_error("must specify a config file");
-            }();
+
+            auto const configFile = vm["conf"].as<std::string>();
 
             if (!boost::filesystem::exists(configFile))
-                throw std::runtime_error("config file does not exist");
+            {
+                auto const jv = xbwd::config::generateConfig();
+                Json::StyledStreamWriter wr;
+                std::ofstream f(configFile);
+                if (!f)
+                    throw std::runtime_error("can't create config file");
+                wr.write(f, jv);
+            }
 
             Json::Value jv;
             std::ifstream f;

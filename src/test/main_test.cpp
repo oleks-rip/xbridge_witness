@@ -18,6 +18,7 @@
 //==============================================================================
 
 #include <xbwd/app/App.h>
+#include <xbwd/app/Config.h>
 #include <xbwd/basics/StructuredLog.h>
 #include <xbwd/client/WebsocketClient.h>
 #include <xbwd/rpc/fromJSON.h>
@@ -59,6 +60,7 @@ namespace websocket = boost::beast::websocket;
 using tcp = boost::asio::ip::tcp;
 using namespace std::chrono_literals;
 using namespace fmt::literals;
+using namespace xbwd::config;
 
 static std::unique_ptr<App> gApp;
 static std::condition_variable gCv;
@@ -112,28 +114,6 @@ wait_for(
     DBG(std::cout << msg << ", wait finished: " << (b ? "condition" : "timeout")
                   << std::endl;)
     return b;
-}
-
-static std::string
-prepForFmt(std::string_view const sw)
-{
-    std::string s;
-    bool bopen = true;
-    for (auto const c : sw)
-    {
-        if (c == '{')
-            s += "{{";
-        else if (c == '}')
-            s += "}}";
-        else if (c == '`')
-        {
-            s += bopen ? '{' : '}';
-            bopen = !bopen;
-        }
-        else
-            s += c;
-    }
-    return s;
 }
 
 //------------------------------------------------------------------------------

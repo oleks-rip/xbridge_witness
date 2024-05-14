@@ -94,5 +94,12 @@ public:
     explicit Config(Json::Value const& jv);
 };
 
+// use environment variables to generate config json.
+Json::Value
+generateConfig();
+
+std::string
+prepForFmt(std::string_view const sw);
+
 }  // namespace config
 }  // namespace xbwd

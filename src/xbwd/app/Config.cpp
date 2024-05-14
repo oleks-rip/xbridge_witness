@@ -3,11 +3,18 @@
 
 #include <xbwd/rpc/fromJSON.h>
 
+#include <ripple/json/json_reader.h>
 #include <ripple/protocol/AccountID.h>
 #include <ripple/protocol/KeyType.h>
+#include <ripple/protocol/SecretKey.h>
+
+#include <boost/process/env.hpp>
+#include <fmt/format.h>
 
 namespace xbwd {
 namespace config {
+
+using namespace fmt::literals;
 
 namespace {
 ripple::KeyType
@@ -159,6 +166,120 @@ Config::Config(Json::Value const& jv)
             "Attestations");
 #endif
 }
+
+extern const char configTemplate[];
+
+std::string
+prepForFmt(std::string_view const sw)
+{
+    std::string s;
+    bool bopen = true;
+    for (auto const c : sw)
+    {
+        if (c == '{')
+            s += "{{";
+        else if (c == '}')
+            s += "}}";
+        else if (c == '`')
+        {
+            s += bopen ? '{' : '}';
+            bopen = !bopen;
+        }
+        else
+            s += c;
+    }
+    return s;
+}
+
+Json::Value
+generateConfig()
+{
+    Json::Value jv;
+    boost::process::environment const e = boost::this_process::environment();
+
+    auto const keyType = ripple::KeyType::secp256k1;
+    auto const lSubPair = ripple::randomKeyPair(keyType);
+    auto const iSubPair = ripple::randomKeyPair(keyType);
+    auto const witPair = ripple::randomKeyPair(keyType);
+
+    // secure_erase
+    std::string const s = fmt::format(
+        fmt::runtime(prepForFmt(configTemplate)),
+        "lhost"_a = e.at("LHOST").to_string(),
+        "lport"_a = e.at("LPORT").to_string(),
+        "lSubSeed"_a =
+             ripple::toBase58(ripple::TokenType::AccountSecret, lSubPair.second),
+         "lSubType"_a = to_string(keyType),
+         "lSubAcc"_a = ripple::toBase58(ripple::calcAccountID(lSubPair.first)),
+         "lRwdAcc"_a = e.at("LRWD_ACC").to_string(),
+         "ihost"_a = e.at("IHOST").to_string(),
+         "iport"_a = e.at("IPORT").to_string(),
+         "iSubSeed"_a =
+             ripple::toBase58(ripple::TokenType::AccountSecret, iSubPair.second),
+         "iSubType"_a = to_string(keyType),
+         "iSubAcc"_a = ripple::toBase58(ripple::calcAccountID(iSubPair.first)),
+         "iRwdAcc"_a = e.at("IRWD_ACC").to_string(),
+         "logFile"_a = e.at("LOG_FILE").to_string(),
+         "dbDir"_a = e.at("DB_DIR").to_string(),
+         "witSeed"_a =
+             ripple::toBase58(ripple::TokenType::AccountSecret, witPair.second),
+         "witType"_a = to_string(keyType),
+         "lDoorAcc"_a = e.at("LDOOR_ACC").to_string(),
+         "lCurr"_a = e.at("LDOOR_CUR").to_string(),
+         "iDoorAcc"_a = e.at("IDOOR_ACC").to_string(),
+         "iCurr"_a = e.at("IDOOR_CUR").to_string()
+            );
+
+    if (!Json::Reader().parse(s, jv))
+        throw std::runtime_error("internal error while generate config");
+    return jv;
+}
+
+const char configTemplate[] = R"str(
+{
+  "LockingChain": {
+    "Endpoint": {
+      "Host": "`lhost`",
+      "Port": `lport`
+    },
+    "TxnSubmit": {
+      "ShouldSubmit": true,
+      "SigningKeySeed": "`lSubSeed`",
+      "SigningKeyType": "`lSubType`",
+      "SubmittingAccount": "`lSubAcc`"
+    },
+    "RewardAccount": "`lRwdAcc`"
+  },
+  "IssuingChain": {
+    "Endpoint": {
+      "Host": "`ihost`",
+      "Port": `iport`
+    },
+    "TxnSubmit": {
+      "ShouldSubmit": true,
+      "SigningKeySeed": "`iSubSeed`",
+      "SigningKeyType": `iSubType`",
+      "SubmittingAccount": "`iSubAcc`"
+    },
+    "RewardAccount": "`iRwdAcc`"
+  },
+  "RPCEndpoint": {
+    "Host": "127.0.0.3",
+    "Port": 6010
+  },
+  "LogFile": "`logFile`",
+  "LogLevel": "Trace",
+  "DBDir": "`dbDir`",
+  "SigningKeySeed": "`witSeed`",
+  "SigningKeyType": "`witType`",
+  "XChainBridge": {
+    "LockingChainDoor": "`lDoorAcc`",
+    "LockingChainIssue": {"currency": "`lCurr`"},
+    "IssuingChainDoor": "`iDoorAcc`",
+    "IssuingChainIssue": {"currency": "`iCurr`"}
+  }
+}
+)str";
 
 }  // namespace config
 }  // namespace xbwd
