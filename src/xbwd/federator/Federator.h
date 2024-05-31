@@ -36,6 +36,7 @@
 #include <ripple/protocol/XChainAttestations.h>
 
 #include <boost/asio.hpp>
+#include <fmt/format.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -44,11 +45,13 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <pthread.h>
 
 namespace xbwd {
 
@@ -289,6 +292,86 @@ struct AttestedHistoryTx
     fromEvent(FederatorEvent const& e);
 };
 
+// std implementation doesn't prevent writer starvation
+struct rw_mutex
+{
+    pthread_rwlock_t rwm_;
+    pthread_rwlockattr_t rwa_;
+    rw_mutex()
+    {
+        int err = pthread_rwlockattr_init(&rwa_);
+
+#ifdef __linux__
+        if (!err)
+            err = pthread_rwlockattr_setkind_np(
+                &rwa_, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+
+        if (!err)
+            err = pthread_rwlock_init(&rwm_, &rwa_);
+
+        if (err)
+        {
+            auto const s = fmt::format(
+                "Error initializing rwlockattr, err({}): {}",
+                err,
+                strerror(err));
+            std::cerr << s << std::endl;
+            throw std::runtime_error(s);
+        }
+    }
+
+    ~rw_mutex()
+    {
+        pthread_rwlock_destroy(&rwm_);
+        pthread_rwlockattr_destroy(&rwa_);
+    }
+};
+
+struct rd_lock
+{
+    rw_mutex& m_;
+
+    rd_lock(rw_mutex& m) : m_(m)
+    {
+        int err = pthread_rwlock_rdlock(&m_.rwm_);
+        if (err)
+        {
+            auto const s =
+                fmt::format("Error rd lock, err({}): {}", err, strerror(err));
+            std::cerr << s << std::endl;
+            throw std::runtime_error(s);
+        }
+    }
+
+    ~rd_lock()
+    {
+        pthread_rwlock_unlock(&m_.rwm_);
+    }
+};
+
+struct wr_lock
+{
+    rw_mutex& m_;
+
+    wr_lock(rw_mutex& m) : m_(m)
+    {
+        int err = pthread_rwlock_wrlock(&m_.rwm_);
+        if (err)
+        {
+            auto const s =
+                fmt::format("Error wr lock, err({}): {}", err, strerror(err));
+            std::cerr << s << std::endl;
+            throw std::runtime_error(s);
+        }
+    }
+
+    ~wr_lock()
+    {
+        pthread_rwlock_unlock(&m_.rwm_);
+    }
+};
+
 class Federator
 {
     enum LoopTypes {
@@ -302,6 +385,8 @@ class Federator
 
     bool running_ = false;
     std::atomic<bool> requestStop_ = false;
+    // Mutex for stopping processing threads in case of reconnect
+    rw_mutex runningMutex_;
 
     App& app_;
     ripple::STXChainBridge const bridge_;
@@ -315,7 +400,7 @@ class Federator
         // The hash of the latest event (from this chain) that require
         // attestation from the previous session. The same as
         // InitSync.dbTxnHash_ but can be set by operator in config file
-        std::optional<ripple::uint256> lastAttestedCommitTx_;
+        std::optional<ripple::uint256> const lastAttestedCommitTx_;
 
         explicit Chain(config::ChainConfig const& config);
     };
@@ -398,6 +483,10 @@ class Federator
         // historical transactions.
         std::unordered_set<AttestedHistoryTx, ripple::hardened_hash<>>
             attestedTx_;
+
+        // check ordering errors
+        std::int32_t rpcOrderNew_ = -1;
+        std::int32_t rpcOrderOld_ = 0;
     };
 
     ChainArray<InitSync> initSync_;
@@ -473,6 +562,12 @@ public:
 
     void
     setNetworkID(std::uint32_t networkID, ChainType ct);
+
+    void
+    onConnect(ChainType ct);
+
+    std::uint32_t
+    getLastProcessedLedger(ChainType ct) const;
 
 private:
     // Two phase init needed for shared_from this.

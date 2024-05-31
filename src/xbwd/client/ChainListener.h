@@ -135,7 +135,6 @@ public:
         Federator& federator,
         std::optional<ripple::AccountID> signAccount,
         std::uint32_t txLimit,
-        std::uint32_t lastLedgerProcessed,
         beast::Journal j);
 
     ~ChainListener() = default;

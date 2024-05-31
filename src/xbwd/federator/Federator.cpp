@@ -42,9 +42,7 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <exception>
-#include <future>
 #include <sstream>
 #include <stdexcept>
 
@@ -246,7 +244,6 @@ Federator::init(
             *this,
             config.signingAccount,
             config.txLimit,
-            initSync_[ChainType::locking].dbLedgerSqn_,
             l.journal("LListener"));
 
     std::unique_ptr<ChainListener> sidechainListener =
@@ -257,7 +254,6 @@ Federator::init(
             *this,
             config.signingAccount,
             config.txLimit,
-            initSync_[ChainType::issuing].dbLedgerSqn_,
             l.journal("IListener"));
 
     chains_[ChainType::locking].listener_ = std::move(mainchainListener);
@@ -266,6 +262,54 @@ Federator::init(
     chains_[ChainType::issuing].listener_ = std::move(sidechainListener);
     chains_[ChainType::issuing].listener_->init(
         ios, config.issuingChainConfig.chainIp);
+}
+
+void
+Federator::onConnect(ChainType ct)
+{
+    JLOGV(j_.debug(), "Federator::onConnect", jv("chainType", to_string(ct)));
+
+    // Stop every processing thread.
+    wr_lock ls(runningMutex_);
+
+    // {
+    //     std::lock_guard<std::mutex> lg(eventsMutex_);
+    //     events_[ct].clear();
+    // }
+
+    // {
+    //     std::lock_guard<std::mutex> lg(txnsMutex_);
+    //     txns_[ct].clear();
+    //     submitted_[ct].clear();
+    //     errored_[ct].clear();
+
+    //     txnsInProcessing_[ct].clear();
+    // }
+
+    // {
+    //     std::lock_guard<std::mutex> lg(batchMutex_);
+    //     curClaimAtts_[ct].clear();
+    //     curCreateAtts_[ct].clear();
+    //     accountSqns_[ct] = 0;
+    // }
+
+    auto& is = initSync_[ct];
+    is.syncing_ = true;
+    is.historyDone_ = false;
+    is.rpcOrder_ = std::numeric_limits<std::int32_t>::min();
+    is.attestedTx_.clear();
+    // Don't need to reset dbLedgerSqn_ and dbTxnHash_
+    is.rpcOrderNew_ = -1;
+    is.rpcOrderOld_ = 0;
+
+    syncFinished_ = false;
+    replays_[ct].clear();
+}
+
+std::uint32_t
+Federator::getLastProcessedLedger(ChainType ct) const
+{
+    return initSync_[ct].dbLedgerSqn_;
 }
 
 void
@@ -602,13 +646,14 @@ Federator::initSync(
 {
     JLOG(j_.trace()) << "initSync start";
 
-    if (!initSync_[ct].historyDone_)
+    auto& is = initSync_[ct];
+    if (!is.historyDone_)
     {
-        if (initSync_[ct].dbTxnHash_ == eHash ||
+        if (is.dbTxnHash_ == eHash ||
             (chains_[ct].lastAttestedCommitTx_ == eHash))
         {
-            initSync_[ct].historyDone_ = true;
-            initSync_[ct].rpcOrder_ = rpcOrder;
+            is.historyDone_ = true;
+            is.rpcOrder_ = rpcOrder;
             JLOGV(
                 j_.info(),
                 "initSync found previous tx",
@@ -617,30 +662,24 @@ Federator::initSync(
     }
 
     bool const historical = rpcOrder < 0;
-    bool const skip = historical && initSync_[ct].historyDone_;
+    bool const skip = historical && is.historyDone_;
     if (!skip)
     {
+        JLOG(j_.trace()) << "initSync " << to_string(ct)
+                         << ", rpcOrderNew=" << is.rpcOrderNew_
+                         << " rpcOrderOld=" << is.rpcOrderOld_
+                         << " rpcOrder=" << rpcOrder;
+        if (historical)
         {
-            // TODO remove after tests or when adding multiple bridges
-            // assert order of insertion, so that the replay later will be in
-            // order
-            static ChainArray<std::int32_t> rpcOrderNew{-1, -1};
-            static ChainArray<std::int32_t> rpcOrderOld{0, 0};
-            JLOG(j_.trace()) << "initSync " << to_string(ct)
-                             << ", rpcOrderNew=" << rpcOrderNew[ct]
-                             << " rpcOrderOld=" << rpcOrderOld[ct]
-                             << " rpcOrder=" << rpcOrder;
-            if (historical)
-            {
-                assert(rpcOrderOld[ct] > rpcOrder);
-                rpcOrderOld[ct] = rpcOrder;
-            }
-            else
-            {
-                assert(rpcOrderNew[ct] < rpcOrder);
-                rpcOrderNew[ct] = rpcOrder;
-            }
+            assert(is.rpcOrderOld_ > rpcOrder);
+            is.rpcOrderOld_ = rpcOrder;
         }
+        else
+        {
+            assert(is.rpcOrderNew_ < rpcOrder);
+            is.rpcOrderNew_ = rpcOrder;
+        }
+
         if (historical)
             replays_[ct].emplace_front(e);
         else
@@ -842,7 +881,7 @@ Federator::onEvent(event::XChainCommitDetected const& e)
 }
 
 void
-Federator::onDBEvent(const event::XChainCommitDetected& e)
+Federator::onDBEvent(event::XChainCommitDetected const& e)
 {
     JLOGV(j_.debug(), "onDBEvent", jv("event", e.toJson()));
 
@@ -955,6 +994,7 @@ Federator::onDBEvent(const event::XChainCommitDetected& e)
             fmt::arg("table_name", db_init::xChainSyncTable));
         auto const chainType = static_cast<std::uint32_t>(ct);
         *session << sql, soci::use(txnIdHex), soci::use(chainType);
+        initSync_[ct].dbTxnHash_ = e.txnHash_;
     }
 }
 
@@ -1165,6 +1205,7 @@ Federator::onDBEvent(event::XChainAccountCreateCommitDetected const& e)
             fmt::arg("table_name", db_init::xChainSyncTable));
         auto const chainType = static_cast<std::uint32_t>(ct);
         *session << sql, soci::use(txnIdHex), soci::use(chainType);
+        initSync_[ct].dbTxnHash_ = e.txnHash_;
     }
 }
 
@@ -1849,7 +1890,6 @@ Federator::submitTxn(SubmissionPtr&& submission, ChainType ct)
         submitted_[ct].emplace_back(std::move(submission));
     }
     chains_[ct].listener_->send("submit", request, callback);
-    // JLOG(j_.trace()) << "txn submitted";  // the listener logs as well
 }
 
 void
@@ -1878,6 +1918,8 @@ Federator::mainLoop(ChainType ct)
     localEvents.reserve(16);
     while (!requestStop_)
     {
+        rd_lock ls(runningMutex_);
+
         {
             std::lock_guard l{eventsMutex_};
             assert(localEvents.empty());
@@ -2012,6 +2054,8 @@ Federator::txnSubmitLoop()
             if (accountStrs[ct].empty())
                 continue;
 
+            rd_lock ls(runningMutex_);
+
             decltype(txns_)::type localTxns;
             decltype(txns_)::type* pLocal = nullptr;
             bool checkReady = false;
@@ -2123,6 +2167,8 @@ Federator::dbLoop()
     localEvents.reserve(16);
     while (!requestStop_)
     {
+        rd_lock ls(runningMutex_);
+
         {
             std::lock_guard l{eventsMutex_};
             assert(localEvents.empty());

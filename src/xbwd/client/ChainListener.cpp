@@ -55,7 +55,6 @@ ChainListener::ChainListener(
     Federator& federator,
     std::optional<ripple::AccountID> signAccount,
     std::uint32_t txLimit,
-    std::uint32_t lastLedgerProcessed,
     beast::Journal j)
     : chainType_{chainType}
     , bridge_{sidechain}
@@ -66,7 +65,6 @@ ChainListener::ChainListener(
     , j_{j}
     , txLimit_(txLimit)
 {
-    hp_.lastLedgerProcessed_ = lastLedgerProcessed;
 }
 
 void
@@ -137,6 +135,8 @@ ChainListener::onConnect()
     prevLedgerIndex_ = 0;
     txnHistoryIndex_ = 0;
     hp_.clear();
+    hp_.lastLedgerProcessed_ = federator_.getLastProcessedLedger(chainType_);
+    federator_.onConnect(chainType_);
 
     if (signAccount_)
     {
@@ -1930,6 +1930,8 @@ HistoryProcessor::clear()
     startupLedger_ = 0;
     toRequestLedger_ = 0;
     minValidatedLedger_ = 0;
+    ledgerProcessed_ = 0;
+    lastLedgerProcessed_ = 0;
 }
 
 }  // namespace xbwd
